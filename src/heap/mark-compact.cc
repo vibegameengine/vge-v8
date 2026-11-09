@@ -4,6 +4,8 @@
 
 #include "src/heap/mark-compact.h"
 
+#include "include/v8-gray-marking.h"
+
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -243,7 +245,20 @@ class MainMarkingVisitor final
             mark_compact_epoch, code_flush_mode, trace_embedder_fields,
             should_keep_ages_unchanged, code_flushing_increase) {}
 
+  void set_gray_edges(std::vector<std::pair<Address, Address>>* gray_edges) {
+    gray_edges_ = gray_edges;
+  }
+
  private:
+  V8_INLINE void AddStrongReferenceForReferenceSummarizer(
+      Tagged<HeapObject> host, Tagged<HeapObject> obj) {
+    if (V8_UNLIKELY(gray_edges_ != nullptr)) {
+      gray_edges_->emplace_back(host.ptr(), obj.ptr());
+    }
+  }
+
+  std::vector<std::pair<Address, Address>>* gray_edges_ = nullptr;
+
   // Functions required by MarkingVisitorBase.
 
   template <typename TSlot>
@@ -2174,6 +2189,9 @@ std::pair<size_t, size_t> MarkCompactCollector::ProcessMarkingWorklist(
     DCHECK_EQ(GetIsolateFromWritableObject(object), isolate);
     DCHECK(heap_->Contains(object));
     DCHECK(!(marking_state_->IsUnmarked(object)));
+    if (V8_UNLIKELY(recording_gray_objects_)) {
+      gray_objects_.push_back(object.ptr());
+    }
     if (mode == MarkCompactCollector::MarkingWorklistProcessingMode::
                     kTrackNewlyDiscoveredObjects) {
       AddNewlyDiscovered(object);
@@ -2456,6 +2474,8 @@ void MarkCompactCollector::MarkLiveObjects() {
     VerifyEphemeronMarking();
   }
 
+  MarkGrayRootsAfterBlackFixpoint(&root_visitor);
+
   if (was_marked_incrementally) {
     // Disable the marking barrier after concurrent/parallel marking has
     // finished as it will reset page flags that share the same bitmap as
@@ -2465,6 +2485,227 @@ void MarkCompactCollector::MarkLiveObjects() {
   }
 
   epoch_++;
+}
+
+namespace {
+
+Address* GlobalSlot(const v8::Global<v8::Value>& handle) {
+  return *reinterpret_cast<Address* const*>(&handle);
+}
+
+class GrayRootMarkerImpl final : public v8::GrayRootMarker {
+ public:
+  explicit GrayRootMarkerImpl(RootVisitor* root_visitor)
+      : root_visitor_(root_visitor) {}
+
+  void Mark(const v8::Global<v8::Value>& root) override {
+    if (root.IsEmpty()) return;
+    root_visitor_->VisitRootPointer(Root::kGlobalHandles, nullptr,
+                                    FullObjectSlot(GlobalSlot(root)));
+  }
+
+ private:
+  RootVisitor* root_visitor_;
+};
+
+class GrayObjectIndex final {
+ public:
+  explicit GrayObjectIndex(size_t expected) {
+    size_t capacity = 16;
+    while (capacity < expected * 2) capacity <<= 1;
+    slots_.assign(capacity, Slot{0, v8::kNotGrayIndex});
+    mask_ = capacity - 1;
+  }
+
+  bool Insert(Address key, uint32_t value) {
+    for (size_t i = Hash(key);; i = (i + 1) & mask_) {
+      Slot& slot = slots_[i];
+      if (slot.key == key) return false;
+      if (slot.key == 0) {
+        slot = Slot{key, value};
+        return true;
+      }
+    }
+  }
+
+  uint32_t Find(Address key) const {
+    for (size_t i = Hash(key);; i = (i + 1) & mask_) {
+      const Slot& slot = slots_[i];
+      if (slot.key == key) return slot.value;
+      if (slot.key == 0) return v8::kNotGrayIndex;
+    }
+  }
+
+ private:
+  struct Slot {
+    Address key;
+    uint32_t value;
+  };
+
+  size_t Hash(Address key) const {
+    return static_cast<size_t>((key >> 3) * 0x9E3779B97F4A7C15ull >> 20) & mask_;
+  }
+
+  std::vector<Slot> slots_;
+  size_t mask_ = 0;
+};
+
+class GrayMarkingResultImpl final : public v8::GrayMarkingResult {
+ public:
+  GrayMarkingResultImpl(MarkingState* marking_state,
+                        const std::vector<Address>& gray_objects,
+                        const GrayObjectIndex& gray_index,
+                        const std::vector<v8::GrayMarkingEdge>& edges,
+                        const std::vector<v8::GrayMarkingEphemeron>& ephemerons,
+                        const std::vector<v8::GrayMarkingWeakRef>& weak_refs)
+      : marking_state_(marking_state),
+        gray_objects_(gray_objects),
+        gray_index_(gray_index),
+        edges_(edges),
+        ephemerons_(ephemerons),
+        weak_refs_(weak_refs) {}
+
+  uintptr_t AddressOf(const v8::Global<v8::Value>& handle) const override {
+    return handle.IsEmpty() ? 0 : *GlobalSlot(handle);
+  }
+
+  bool IsMarked(uintptr_t object) const override {
+    Tagged<Object> value(object);
+    return IsHeapObject(value) &&
+           marking_state_->IsMarked(HeapObject::cast(value));
+  }
+
+  bool IsGray(uintptr_t object) const override {
+    return gray_index_.Find(object) != v8::kNotGrayIndex;
+  }
+
+  uint32_t GrayIndexOf(uintptr_t object) const override {
+    return gray_index_.Find(object);
+  }
+
+  uintptr_t InnerGlobalOfProxy(uintptr_t object) const override {
+    Tagged<Object> value(object);
+    if (!IsJSGlobalProxy(value)) return 0;
+    return HeapObject::cast(value)->map()->prototype().ptr();
+  }
+
+  const uintptr_t* GrayObjects(size_t* count) const override {
+    *count = gray_objects_.size();
+    return reinterpret_cast<const uintptr_t*>(gray_objects_.data());
+  }
+
+  const v8::GrayMarkingEdge* Edges(size_t* count) const override {
+    *count = edges_.size();
+    return edges_.data();
+  }
+
+  const v8::GrayMarkingEphemeron* Ephemerons(size_t* count) const override {
+    *count = ephemerons_.size();
+    return ephemerons_.data();
+  }
+
+  const v8::GrayMarkingWeakRef* WeakRefs(size_t* count) const override {
+    *count = weak_refs_.size();
+    return weak_refs_.data();
+  }
+
+ private:
+  MarkingState* marking_state_;
+  const std::vector<Address>& gray_objects_;
+  const GrayObjectIndex& gray_index_;
+  const std::vector<v8::GrayMarkingEdge>& edges_;
+  const std::vector<v8::GrayMarkingEphemeron>& ephemerons_;
+  const std::vector<v8::GrayMarkingWeakRef>& weak_refs_;
+};
+
+}  // namespace
+
+void MarkCompactCollector::MarkGrayRootsAfterBlackFixpoint(
+    RootVisitor* root_visitor) {
+  v8::GrayMarkingClient* client = heap_->gray_marking_client();
+  if (!client) return;
+
+  recording_gray_objects_ = true;
+  marking_visitor_->set_gray_edges(&gray_edges_);
+  GrayRootMarkerImpl marker(root_visitor);
+  client->MarkGrayRoots(marker);
+  MarkTransitiveClosure();
+  CHECK(local_marking_worklists_->IsEmpty());
+  CHECK(local_weak_objects()->current_ephemerons_local.IsLocalAndGlobalEmpty());
+  CHECK(
+      local_weak_objects()->discovered_ephemerons_local.IsLocalAndGlobalEmpty());
+  CHECK(IsCppHeapMarkingFinished(heap_, local_marking_worklists_.get()));
+  marking_visitor_->set_gray_edges(nullptr);
+  recording_gray_objects_ = false;
+
+  GrayObjectIndex gray_index(gray_objects_.size());
+  size_t unique_objects = 0;
+  for (Address object : gray_objects_) {
+    if (gray_index.Insert(object, static_cast<uint32_t>(unique_objects))) {
+      gray_objects_[unique_objects++] = object;
+    }
+  }
+  gray_objects_.resize(unique_objects);
+  auto is_gray = [&gray_index](Address object) {
+    return gray_index.Find(object) != v8::kNotGrayIndex;
+  };
+
+  std::vector<v8::GrayMarkingEdge> edges;
+  std::unordered_map<Address, Address> table_owner;
+  for (const auto& [from, to] : gray_edges_) {
+    if (!is_gray(from) || !is_gray(to)) continue;
+    Tagged<HeapObject> host = HeapObject::cast(Tagged<Object>(from));
+    if (IsEphemeronHashTable(host)) continue;
+    if (IsJSWeakCollection(host) && IsEphemeronHashTable(Tagged<Object>(to))) {
+      table_owner[to] = from;
+    }
+    edges.push_back({from, to});
+  }
+
+  std::vector<v8::GrayMarkingEphemeron> ephemerons;
+  local_weak_objects()->ephemeron_hash_tables_local.Publish();
+  weak_objects_.ephemeron_hash_tables.Iterate(
+      [&](Tagged<EphemeronHashTable> table) {
+        for (InternalIndex i : table->IterateEntries()) {
+          Tagged<Object> key_object = table->KeyAt(i);
+          Tagged<Object> value_object = table->ValueAt(i);
+          if (!IsHeapObject(key_object) || !IsHeapObject(value_object)) {
+            continue;
+          }
+          Tagged<HeapObject> key = HeapObject::cast(key_object);
+          if (!key.InReadOnlySpace() && !marking_state_->IsMarked(key)) {
+            continue;
+          }
+          if (!is_gray(value_object.ptr())) continue;
+          auto owner = table_owner.find(table.ptr());
+          ephemerons.push_back(
+              {owner == table_owner.end() ? Address(0) : owner->second,
+               table.ptr(), key.ptr(), value_object.ptr()});
+        }
+      });
+
+  std::vector<v8::GrayMarkingWeakRef> weak_refs;
+  auto add_weak_ref = [&](Tagged<JSWeakRef> weak_ref) {
+    Tagged<Object> target = weak_ref->target();
+    if (IsHeapObject(target) && is_gray(target.ptr())) {
+      weak_refs.push_back({weak_ref.ptr(), target.ptr()});
+    }
+  };
+  local_weak_objects()->js_weak_refs_local.Publish();
+  weak_objects_.js_weak_refs.Iterate([&](Tagged<JSWeakRef> weak_ref) {
+    if (!is_gray(weak_ref.ptr())) add_weak_ref(weak_ref);
+  });
+  for (Address address : gray_objects_) {
+    Tagged<Object> object(address);
+    if (IsJSWeakRef(object)) add_weak_ref(JSWeakRef::cast(object));
+  }
+
+  GrayMarkingResultImpl result(marking_state_, gray_objects_, gray_index, edges,
+                               ephemerons, weak_refs);
+  client->GrayMarkingFinished(result);
+
+  std::vector<Address>().swap(gray_objects_);
+  std::vector<std::pair<Address, Address>>().swap(gray_edges_);
 }
 
 namespace {
@@ -5205,4 +5446,18 @@ void MarkCompactCollector::Sweep() {
 }
 
 }  // namespace internal
+
+void SetGrayMarkingClient(Isolate* isolate, GrayMarkingClient* client) {
+  reinterpret_cast<internal::Isolate*>(isolate)
+      ->heap()
+      ->set_gray_marking_client(client);
+}
+
+bool IsGlobalInYoungGeneration(const Global<Value>& handle) {
+  internal::Tagged<internal::Object> object(*internal::GlobalSlot(handle));
+  return internal::IsHeapObject(object) &&
+         internal::Heap::InYoungGeneration(
+             internal::HeapObject::cast(object));
+}
+
 }  // namespace v8

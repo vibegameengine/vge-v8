@@ -718,6 +718,8 @@ void MarkingVisitorBase<ConcreteVisitor>::VisitDescriptorsForMap(
     // std::min<int>() below.
     const auto descriptors_to_mark = std::min<int>(
         number_of_own_descriptors, descriptors->number_of_descriptors());
+    concrete_visitor()->AddStrongReferenceForReferenceSummarizer(map,
+                                                                 descriptors);
     concrete_visitor()->TryMark(descriptors);
     if (DescriptorArrayMarkingState::TryUpdateIndicesToMark(
             mark_compact_epoch_, descriptors, descriptors_to_mark)) {

@@ -69,7 +69,11 @@ class V8_EXPORT_PRIVATE ContextualVariable {
   static bool HasScope() { return Top() != nullptr; }
 
  private:
+#if defined(V8_OS_WIN) && defined(BUILDING_V8_SHARED)
+  inline static Scope* top_ = nullptr;
+#else
   inline static thread_local Scope* top_ = nullptr;
+#endif
 
 #if defined(USING_V8_SHARED)
   // Hide the access to `top_` from other DLLs/libraries, since access to

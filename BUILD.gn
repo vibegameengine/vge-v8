@@ -6675,14 +6675,14 @@ if (v8_check_header_includes) {
 # Produce a single static library for embedders
 #
 
-if (v8_monolithic) {
+#if (v8_monolithic) {
   assert(!is_component_build,
          "Set `is_component_build = false` for v8_monolithic.")
 
   # Using external startup data would produce separate files.
   assert(!v8_use_external_startup_data,
          "Set `v8_use_external_startup_data = false` for v8_monolithic.")
-  v8_static_library("v8_monolith") {
+  v8_static_library("wee8") {
     deps = [
       ":v8",
       ":v8_libbase",
@@ -6692,16 +6692,17 @@ if (v8_monolithic) {
 
     configs = [ ":internal_config" ]
   }
-}
+#}
 
 if (v8_enable_webassembly) {
-  v8_static_library("wee8") {
+  v8_static_library("wee9") {
     deps = [
       ":v8_base",
       ":v8_libbase",
       ":v8_libplatform",
       ":v8_shared_internal_headers",
       ":v8_snapshot",
+      ":v8cc($v8_snapshot_toolchain)",
       "//build/win:default_exe_manifest",
     ]
     if (v8_enable_vtunejit) {
@@ -6752,7 +6753,35 @@ if (current_toolchain == v8_generator_toolchain) {
 }
 
 if (current_toolchain == v8_snapshot_toolchain) {
-  v8_executable("mksnapshot") {
+  
+  v8_executable("v8cc") {
+    visibility = [ ":*" ]  # Only targets in this file can depend on this.
+
+    sources = [
+      "src/snapshot/v8cc.cc",
+    ]
+
+    if (v8_control_flow_integrity) {
+      sources += [ "src/deoptimizer/deoptimizer-cfi-empty.cc" ]
+    }
+
+    configs = [ ":internal_config" ]
+
+    deps = [
+      ":v8_base_without_compiler",
+      ":v8_compiler_for_mksnapshot",
+      ":v8_init",
+      ":v8_libbase",
+      ":v8_libplatform",
+      ":v8_maybe_icu",
+      ":v8_shared_internal_headers",
+      ":v8_tracing",
+      ":v8_turboshaft",
+      "//build/win:default_exe_manifest",
+      ":v8_snapshot",
+    ]
+  }
+    v8_executable("mksnapshot") {
     visibility = [ ":*" ]  # Only targets in this file can depend on this.
 
     sources = [

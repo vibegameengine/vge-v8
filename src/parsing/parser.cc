@@ -981,7 +981,7 @@ FunctionLiteral* Parser::DoParseFunction(Isolate* isolate, ParseInfo* info,
       if (IsAsyncFunction(kind)) {
         DCHECK(!scanner()->HasLineTerminatorAfterNext());
         if (!Check(Token::ASYNC)) {
-          CHECK(stack_overflow());
+          //CHECK(stack_overflow());
           return nullptr;
         }
         if (!(peek_any_identifier() || peek() == Token::LPAREN)) {

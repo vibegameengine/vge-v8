@@ -59,6 +59,10 @@ class Stack;
 }  // namespace heap::base
 
 namespace v8 {
+class GrayMarkingClient;
+}  // namespace v8
+
+namespace v8 {
 
 namespace debug {
 using OutOfMemoryCallback = void (*)(void* data);
@@ -1087,6 +1091,13 @@ class Heap final {
   V8_EXPORT_PRIVATE void DetachCppHeap();
 
   v8::CppHeap* cpp_heap() const { return cpp_heap_; }
+
+  void set_gray_marking_client(v8::GrayMarkingClient* client) {
+    gray_marking_client_ = client;
+  }
+  v8::GrayMarkingClient* gray_marking_client() const {
+    return gray_marking_client_;
+  }
 
   const cppgc::EmbedderStackState* overriden_stack_state() const;
 
@@ -2235,6 +2246,7 @@ class Heap final {
 #endif
 
   v8::CppHeap* cpp_heap_ = nullptr;  // Owned by the embedder.
+  v8::GrayMarkingClient* gray_marking_client_ = nullptr;
   EmbedderRootsHandler* embedder_roots_handler_ =
       nullptr;  // Owned by the embedder.
 

@@ -239,6 +239,8 @@ class MarkCompactCollector final {
   // Perform Wrapper Tracing if in use.
   void PerformWrapperTracing();
 
+  void MarkGrayRootsAfterBlackFixpoint(RootVisitor* root_visitor);
+
   // Retain dying maps for `v8_flags.retain_maps_for_n_gc` garbage collections
   // to increase chances of reusing of map transition tree in future.
   void RetainMaps();
@@ -357,6 +359,9 @@ class MarkCompactCollector final {
   bool black_allocation_ = false;
   bool have_code_to_deoptimize_ = false;
   bool parallel_marking_ = false;
+  bool recording_gray_objects_ = false;
+  std::vector<Address> gray_objects_;
+  std::vector<std::pair<Address, Address>> gray_edges_;
 
   MarkingWorklists marking_worklists_;
   std::unique_ptr<MarkingWorklists::Local> local_marking_worklists_;
